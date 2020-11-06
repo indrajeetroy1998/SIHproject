@@ -1,0 +1,395 @@
+
+/*
+  Optical SP02 Detection (SPK Algorithm) using the MAX30105 Breakout
+  By: Nathan Seidle @ SparkFun Electronics
+  Date: October 19th, 2016
+  https://github.com/sparkfun/MAX30105_Breakout
+
+  This demo shows heart rate and SPO2 levels.
+
+  It is best to attach the sensor to your finger using a rubber band or other tightening 
+  device. Humans are generally bad at applying constant pressure to a thing. When you 
+  press your finger against the sensor it varies enough to cause the blood in your 
+  finger to flow differently which causes the sensor readings to go wonky.
+
+  This example is based on MAXREFDES117 and RD117_LILYPAD.ino from Maxim. Their example
+  was modified to work with the SparkFun MAX30105 library and to compile under Arduino 1.6.11
+  Please see license file for more info.
+
+  Hardware Connections (Breakoutboard to Arduino):
+  -5V = 5V (3.3V is allowed)
+  -GND = GND
+  -SDA = A4 (or SDA)
+  -SCL = A5 (or SCL)
+  -INT = Not connected
+ 
+  The MAX30105 Breakout can handle 5V or 3.3V I2C logic. We recommend powering the board with 5V
+  but it will also run at 3.3V.
+*/
+
+#include <Wire.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+#include <ESP8266WiFi.h>
+#include "Adafruit_MQTT.h"
+#include "Adafruit_MQTT_Client.h"
+MAX30105 particleSensor;
+
+
+unsigned long overallstarttime;
+unsigned long datastarttime;
+unsigned long dataperiod=15000;
+unsigned long overallperiod=60000;
+unsigned long currenttime;
+/************************* ISR Routine *********************************/
+
+const byte pin5 = 15;
+void ICACHE_RAM_ATTR ISRoutine ();
+
+/************************* WiFi Access Point *********************************/
+
+#define WLAN_SSID       "AndroidAP_1709"
+#define WLAN_PASS       "papapapa"
+
+/************************* Adafruit.io Setup *********************************/
+
+#define AIO_SERVER      "io.adafruit.com"
+#define AIO_SERVERPORT  1883                   // use 8883 for SSL
+#define AIO_USERNAME    "indrajeetroy1998"
+#define AIO_KEY         "aio_Ktog28AMyH3uXYxkENoQea2vvM9G"
+
+/************ Global State (you don't need to change this!) ******************/
+
+// Create an ESP8266 WiFiClient class to connect to the MQTT server.
+WiFiClient client;
+// or... use WiFiFlientSecure for SSL
+//WiFiClientSecure client;
+
+// Setup the MQTT client class by passing in the WiFi client and MQTT server and login details.
+Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO_KEY);
+
+/****************************** Feeds ***************************************/
+
+// Setup a feed called 'photocell' for publishing.
+// Notice MQTT paths for AIO follow the form: <username>/feeds/<feedname>
+Adafruit_MQTT_Publish spo20 = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/spo2measure");
+Adafruit_MQTT_Publish heartrate = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/bpmmeasure");
+Adafruit_MQTT_Publish bodytemperature = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/bodytemperature");
+Adafruit_MQTT_Publish sos = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/emergency-sos");
+
+
+/*// Setup a feed called 'onoff' for subscribing to changes.
+Adafruit_MQTT_Subscribe onoffbutton = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/onoff");
+*/
+
+
+
+
+
+
+
+
+
+#define MAX_BRIGHTNESS 255
+void MQTT_connect();
+uint32_t x=0;
+
+
+#if defined(__AVR_ATmega328P__) || defined(__AVR_ATmega168__)
+//Arduino Uno doesn't have enough SRAM to store 100 samples of IR led data and red led data in 32-bit format
+//To solve this problem, 16-bit MSB of the sampled data will be truncated. Samples become 16-bit data.
+uint16_t irBuffer[100]; //infrared LED sensor data
+uint16_t redBuffer[100];  //red LED sensor data
+#else
+uint32_t irBuffer[100]; //infrared LED sensor data
+uint32_t redBuffer[100];  //red LED sensor data
+#endif
+
+int32_t bufferLength; //data length
+int32_t spo2; //SPO2 value
+int8_t validSPO2; //indicator to show if the SPO2 calculation is valid
+int32_t heartRate; //heart rate value
+int8_t validHeartRate; //indicator to show if the heart rate calculation is valid
+
+byte pulseLED = 14; //Must be on PWM pin
+byte readLED = 2; //Blinks with each data read
+
+//Initiallization of LM35 values
+
+float vref = 3.3;
+float resolution = vref/1023;
+float temperature;
+
+void setup()
+{
+
+  Serial.begin(115200);
+  delay(10);
+
+  Serial.println(F("Adafruit MQTT "));
+
+  // Connect to WiFi access point.
+  Serial.println();
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(WLAN_SSID);
+
+  WiFi.begin(WLAN_SSID, WLAN_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  Serial.println("WiFi connected");
+  Serial.println("IP address: "); 
+  Serial.println(WiFi.localIP());
+
+  // Setup MQTT subscription for onoff feed.
+  //mqtt.subscribe(&onoffbutton);
+
+  //setting up interrupt pin
+  pinMode(pin5,INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(pin5),ISRoutine,FALLING);
+
+  pinMode(pulseLED, OUTPUT);
+  pinMode(readLED, OUTPUT);
+
+  // Initialize sensor
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) //Use default I2C port, 400kHz speed
+  {
+    Serial.println(F("MAX30102 was not found. Please check wiring/power."));
+    while (1);
+  }
+
+//  Serial.println(F("Attach sensor to finger with rubber band. Press any key to start conversion"));
+//  while (Serial.available() == 0) ; //wait until user presses a key
+//  Serial.read();
+
+  byte ledBrightness = 60; //Options: 0=Off to 255=50mA
+  byte sampleAverage = 4; //Options: 1, 2, 4, 8, 16, 32
+  byte ledMode = 2; //Options: 1 = Red only, 2 = Red + IR, 3 = Red + IR + Green
+  byte sampleRate = 100; //Options: 50, 100, 200, 400, 800, 1000, 1600, 3200
+  int pulseWidth = 411; //Options: 69, 118, 215, 411
+  int adcRange = 4096; //Options: 2048, 4096, 8192, 16384
+
+  particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange); //Configure sensor with these settings
+}
+
+void loop()
+{ 
+
+ bufferLength = 100; //buffer length of 100 stores 4 seconds of samples running at 25sps
+
+
+  // Ensure the connection to the MQTT server is alive (this will make the first
+  // connection and automatically reconnect when disconnected).  See the MQTT_connect
+  // function definition further below.
+  MQTT_connect();
+
+  // this is our 'wait for incoming subscription packets' busy subloop
+  // try to spend your time here
+
+/*  Adafruit_MQTT_Subscribe *subscription;
+  while ((subscription = mqtt.readSubscription(5000))) {
+    if (subscription == &onoffbutton) {
+      Serial.print(F("Got: "));
+      Serial.println((char *)onoffbutton.lastread);
+    }
+  }*/
+
+  //read the first 100 samples, and determine the signal range
+  for (byte i = 0 ; i < bufferLength ; i++)
+  {
+    while (particleSensor.available() == false) //do we have new data?
+         particleSensor.check(); //Check the sensor for new data
+
+
+    redBuffer[i] = particleSensor.getRed();
+    irBuffer[i] = particleSensor.getIR();
+    particleSensor.nextSample(); //We're finished with this sample so move to next sample
+
+//    Serial.print(F("red="));
+//    Serial.print(redBuffer[i], DEC);
+//    Serial.print(F(", ir="));
+//    Serial.println(irBuffer[i], DEC);
+Serial.println("Reading....");
+  }
+
+  //calculate heart rate and SpO2 after first 100 samples (first 4 seconds of samples)
+  maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+
+  //Continuously taking samples from MAX30102.  Heart rate and SpO2 are calculated every 1 second
+  overallstarttime=millis();
+  while(currenttime<overallstarttime+dataperiod)
+  {
+    //dumping the first 25 sets of samples in the memory and shift the last 75 sets of samples to the top
+    temperature = analogRead(A0);
+    temperature = (temperature*resolution);
+    temperature = temperature*100;
+    
+    for (byte i = 25; i < 100; i++)
+    {
+      redBuffer[i - 25] = redBuffer[i];
+      irBuffer[i - 25] = irBuffer[i];
+    }
+
+    //take 25 sets of samples before calculating the heart rate.
+    for (byte i = 75; i < 100; i++)
+    {
+      while (particleSensor.available() == false) //do we have new data?
+        particleSensor.check(); //Check the sensor for new data
+
+      digitalWrite(readLED, !digitalRead(readLED)); //Blink onboard LED with every data read
+
+      redBuffer[i] = particleSensor.getRed();
+      irBuffer[i] = particleSensor.getIR();
+      particleSensor.nextSample(); //We're finished with this sample so move to next sample
+
+      //send samples and calculation result to terminal program through UART
+//      Serial.print(F("red="));
+//      Serial.print(redBuffer[i], DEC);
+//      Serial.print(F(", ir="));
+//      Serial.print(irBuffer[i], DEC);
+
+//      Serial.print(F(" HR="));
+//      Serial.print(heartRate, DEC);
+//
+////      Serial.print(F(", HRvalid="));
+////      Serial.print(validHeartRate, DEC);
+//
+//      Serial.print(F(", SPO2="));
+//      Serial.print(spo2, DEC);
+//
+////      Serial.print(F(", SPO2Valid="));
+////      Serial.println(validSPO2, DEC);
+//     
+//     Serial.print(F(", Body_temperature="));
+//     Serial.print(temperature, DEC);
+//     Serial.print('\n');
+    }
+   digitalWrite(readLED, HIGH);
+   delay(500);
+   digitalWrite(readLED, LOW);
+    //After gathering 25 new samples recalculate HR and SP02
+    maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+    currenttime=millis();
+  }
+
+
+
+  // Now we can publish stuff!
+  if(spo2<80)
+  {
+  Serial.print(F("\nSending spo2 val "));
+  Serial.print(0);
+  Serial.print("...");
+  if (! spo20.publish(0)) {
+    Serial.println(F("Failed"));
+  } else 
+  {
+    Serial.println(F("OK!"));
+  }
+  }
+  else
+  {
+  Serial.print(F("\nSending spo2 val "));
+  Serial.print(spo2);
+  Serial.print("...");
+  if (! spo20.publish(spo2)) {
+    Serial.println(F("Failed"));
+  } else {
+    Serial.println(F("OK!"));
+  }
+    }
+
+
+  if(heartRate<50)
+  {
+  Serial.print(F("\nSending bpm val "));
+  Serial.print(0);
+  Serial.print("...");
+  if (! heartrate.publish(0)) {
+    Serial.println(F("Failed"));
+  } else 
+  {
+    Serial.println(F("OK!"));
+  }
+  }
+  else
+  {
+  Serial.print(F("\nSending BPM val "));
+  Serial.print(heartRate);
+  Serial.print("...");
+  if (! heartrate.publish(heartRate)) {
+    Serial.println(F("Failed"));
+  } else 
+  {
+    Serial.println(F("OK!"));
+  }
+
+  }
+
+  Serial.print(F("\nSending Body Temperature val "));
+  Serial.print(temperature);
+  Serial.print("...");
+  if (! bodytemperature.publish(temperature)) {
+    Serial.println(F("Failed"));
+  } else 
+  {
+    Serial.println(F("OK!"));
+  }
+
+  char sos2[] = "REBOOT";
+  sos.publish(sos2);  
+  
+
+  // ping the server to keep the mqtt connection alive
+  // NOT required if you are publishing once every KEEPALIVE seconds
+  /*
+  if(! mqtt.ping()) {
+    mqtt.disconnect();
+  }
+  */
+
+
+
+
+
+  
+  delay(10000);
+}
+
+
+// Function to connect and reconnect as necessary to the MQTT server.
+// Should be called in the loop function and it will take care if connecting.
+void MQTT_connect() {
+  int8_t ret;
+
+  // Stop if already connected.
+  if (mqtt.connected()) {
+    return;
+  }
+
+  Serial.print("Connecting to MQTT... ");
+
+  uint8_t retries = 3;
+  while ((ret = mqtt.connect()) != 0) { // connect will return 0 for connected
+       Serial.println(mqtt.connectErrorString(ret));
+       Serial.println("Retrying MQTT connection in 5 seconds...");
+       mqtt.disconnect();
+       delay(5000);  // wait 5 seconds
+       retries--;
+       if (retries == 0) {
+         // basically die and wait for WDT to reset me
+         while (1);
+       }
+  }
+  Serial.println("MQTT Connected!");
+}
+
+void ISRoutine () {
+   Serial.println("Emergency Detected!");
+   char sos1[] = "EMERGENCY !";
+   sos.publish(sos1);  
+}
